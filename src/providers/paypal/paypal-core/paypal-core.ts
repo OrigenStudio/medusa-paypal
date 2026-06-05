@@ -93,7 +93,7 @@ export class PaypalService {
   async getAccessToken(): Promise<string> {
     try {
       const authorization = Buffer.from(
-        `${this.clientId}:${this.clientSecret}`
+        `${this.clientId}:${this.clientSecret}`,
       ).toString("base64");
 
       const authRes = await this.authController.requestToken({
@@ -106,7 +106,7 @@ export class PaypalService {
 
       return accessToken;
     } catch (error) {
-      throw new Error("Failed to get access token: " + error.message);
+      throw new Error(`Failed to get access token: ${JSON.stringify(error)}`);
     }
   }
 
@@ -231,7 +231,7 @@ export class PaypalService {
     if (!this.webhookId) {
       throw new MedusaError(
         MedusaError.Types.INVALID_DATA,
-        "Webhook ID is not set"
+        "Webhook ID is not set",
       );
     }
 
@@ -254,12 +254,12 @@ export class PaypalService {
           webhook_id: this.webhookId,
           webhook_event: body,
         }),
-      }
+      },
     );
 
     if (!verifyWebhookRes.ok) {
       throw new Error(
-        `Failed to verify webhook signature: ${verifyWebhookRes.statusText}`
+        `Failed to verify webhook signature: ${verifyWebhookRes.statusText}`,
       );
     }
 
@@ -303,7 +303,7 @@ export class PaypalService {
   }
 
   private mapShippingData(
-    shipping_info: PaypalCreateOrderInput["shipping_info"]
+    shipping_info: PaypalCreateOrderInput["shipping_info"],
   ): Pick<ShippingDetails, "address"> | undefined {
     if (
       !this.includeShippingData ||

@@ -218,6 +218,37 @@ export default class PaypalModuleService extends AbstractPaymentProvider<Alphabi
       try {
         paypalData = await this.client.captureOrder(orderId);
       } catch (err) {
+        // PayPal can throw even when the underlying capture actually
+        // succeeded — e.g. a network timeout on an otherwise-successful
+        // capture, or an ORDER_ALREADY_CAPTURED error on an idempotent retry.
+        // In those cases the customer has already been charged, so we must NOT
+        // create a new order and return PENDING: doing so orphans the payment
+        // (money captured on the original PayPal order while the session points
+        // at a brand-new, uncaptured one) and the cart-completion workflow
+        // reverts, leaving the customer charged with no order. Re-fetch the
+        // order to learn its true state before treating it as a decline.
+        let retrievedOrder: Order | undefined;
+        try {
+          retrievedOrder = await this.client.retrieveOrder(orderId);
+        } catch (retrieveErr) {
+          this.logger.error(
+            "PayPal authorize payment: failed to retrieve order after capture error:",
+            retrieveErr
+          );
+        }
+
+        const retrievedCapture =
+          retrievedOrder?.purchaseUnits?.[0]?.payments?.captures?.[0];
+
+        if (retrievedCapture?.status === CaptureStatus.Completed) {
+          return {
+            status: PaymentSessionStatus.AUTHORIZED,
+            data: {
+              ...retrievedOrder,
+            },
+          };
+        }
+
         const body = JSON.parse(err?.body || "{}");
 
         const captureData = body?.purchase_units?.[0]?.payments?.captures?.[0];

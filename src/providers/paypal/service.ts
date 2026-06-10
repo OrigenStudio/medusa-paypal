@@ -23,7 +23,11 @@ import {
   UpdatePaymentOutput,
   WebhookActionResult,
 } from "@medusajs/framework/types";
-import { CaptureStatus, Order } from "@paypal/paypal-server-sdk";
+import {
+  CaptureStatus,
+  Order,
+  OrderAuthorizeResponse,
+} from "@paypal/paypal-server-sdk";
 import { WebhookPayload } from "./types";
 import { PaypalCreateOrderInput, PaypalService } from "./paypal-core";
 import { z } from "zod";
@@ -48,6 +52,12 @@ const optionsSchema = z.object({
   webhookId: z.string().optional(),
   includeShippingData: z.boolean().default(false),
   includeCustomerData: z.boolean().default(false),
+  intent: z
+    .enum(["CAPTURE", "AUTHORIZE"])
+    .default("CAPTURE")
+    .describe(
+      "PayPal payment intent. CAPTURE charges the customer as soon as the payment is authorized. AUTHORIZE only places a hold on the funds; they are captured later via capturePayment (e.g. once the order has been created). Default: CAPTURE."
+    ),
 });
 
 export type AlphabitePaypalPluginOptionsType = z.infer<typeof optionsSchema>;
@@ -88,6 +98,16 @@ export type AlphabitePaypalPluginOptions = {
    * Default: false
    */
   includeCustomerData?: boolean;
+
+  /**
+   * PayPal payment intent.
+   * - "CAPTURE": charge the customer as soon as the payment is authorized.
+   * - "AUTHORIZE": only place a hold on the funds; capture later via
+   *   `capturePayment` (e.g. once the order has been created). If the payment is
+   *   never captured, PayPal voids the authorization automatically.
+   * Default: "CAPTURE"
+   */
+  intent?: "CAPTURE" | "AUTHORIZE";
 };
 
 type InjectedDependencies = {
@@ -166,7 +186,16 @@ export default class PaypalModuleService extends AbstractPaymentProvider<Alphabi
 
       const id = input.data.id as string;
 
-      await this.client.captureOrder(id);
+      // AUTHORIZE intent leaves an authorization to capture; CAPTURE intent
+      // captures the order directly.
+      const authorizationId = (input.data as unknown as OrderAuthorizeResponse)
+        ?.purchaseUnits?.[0]?.payments?.authorizations?.[0]?.id;
+
+      if (authorizationId) {
+        await this.client.captureAuthorization(authorizationId);
+      } else {
+        await this.client.captureOrder(id);
+      }
 
       return {
         data: {
@@ -208,6 +237,19 @@ export default class PaypalModuleService extends AbstractPaymentProvider<Alphabi
         MedusaError.Types.INVALID_DATA,
         "PayPal order ID, Amount or Currency is missing, can not capture order."
       );
+    }
+
+    // AUTHORIZE intent: only place a hold on the funds. The actual capture
+    // happens later via `capturePayment` (e.g. once the order is created), so a
+    // failed/rolled-back completion never charges the customer.
+    if (this.options.intent === "AUTHORIZE") {
+      return await this.authorizeOrderOnly({
+        input,
+        orderId,
+        amount,
+        currencyCode,
+        data,
+      });
     }
 
     const isAuthorized =
@@ -337,6 +379,91 @@ export default class PaypalModuleService extends AbstractPaymentProvider<Alphabi
     };
   }
 
+  /**
+   * AUTHORIZE-intent authorization: places a hold on the funds without
+   * capturing them. Returns AUTHORIZED on success. On failure it mints a fresh
+   * order so the customer can retry on the same session, mirroring the capture
+   * flow — but since nothing was captured, a failure never leaves money taken.
+   */
+  private async authorizeOrderOnly({
+    input,
+    orderId,
+    amount,
+    currencyCode,
+    data,
+  }: {
+    input: AuthorizePaymentInput;
+    orderId: string;
+    amount: number;
+    currencyCode: string;
+    data?: AuthorizePaymentInputData;
+  }): Promise<AuthorizePaymentOutput> {
+    let authResult: OrderAuthorizeResponse;
+    try {
+      authResult = await this.client.authorizeOrder(orderId);
+    } catch (err) {
+      this.logger.error("PayPal authorize order error:", err);
+      return this.pendingWithNewOrder({ input, amount, currencyCode, data });
+    }
+
+    const authorization =
+      authResult.purchaseUnits?.[0]?.payments?.authorizations?.[0];
+
+    // "CREATED" means the funds were successfully held. Anything else (denied,
+    // pending, voided, ...) means we couldn't authorize.
+    if (authorization?.status !== "CREATED") {
+      return this.pendingWithNewOrder({ input, amount, currencyCode, data });
+    }
+
+    return {
+      status: PaymentSessionStatus.AUTHORIZED,
+      data: {
+        ...input.data,
+        ...authResult,
+      },
+    };
+  }
+
+  /**
+   * Creates a fresh PayPal order (so the customer can retry) and returns a
+   * PENDING session carrying a retryable error.
+   */
+  private async pendingWithNewOrder({
+    input,
+    amount,
+    currencyCode,
+    data,
+  }: {
+    input: AuthorizePaymentInput;
+    amount: number;
+    currencyCode: string;
+    data?: AuthorizePaymentInputData;
+  }): Promise<AuthorizePaymentOutput> {
+    const newOrder = await this.client.createOrder({
+      amount: Number(amount),
+      currency: currencyCode,
+      sessionId: input.context?.idempotency_key,
+      items: data?.items,
+      shipping_info: data?.shipping_info,
+      email: data?.email,
+    });
+
+    const error: PaypalPaymentError = {
+      code: "404",
+      message: "Payment declined. Please try again or use a different card.",
+      retryable: true,
+    };
+
+    return {
+      status: PaymentSessionStatus.PENDING,
+      data: {
+        ...input.data,
+        ...newOrder,
+        error,
+      },
+    };
+  }
+
   async cancelPayment(input: CancelPaymentInput): Promise<CancelPaymentOutput> {
     try {
       if (!input.data) {
@@ -353,6 +480,20 @@ export default class PaypalModuleService extends AbstractPaymentProvider<Alphabi
           MedusaError.Types.INVALID_DATA,
           "Cancel payment failed! PayPal order ID and capture ID is required to cancel payment"
         );
+      }
+
+      // AUTHORIZE intent: release the hold immediately instead of waiting for
+      // PayPal's automatic void. Best-effort — it no-ops/throws if the
+      // authorization was already captured or voided.
+      const authorizationId = (input.data as unknown as OrderAuthorizeResponse)
+        ?.purchaseUnits?.[0]?.payments?.authorizations?.[0]?.id;
+
+      if (authorizationId) {
+        try {
+          await this.client.voidAuthorization(authorizationId);
+        } catch (voidError) {
+          this.logger.error("PayPal void authorization error:", voidError);
+        }
       }
 
       return {

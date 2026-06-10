@@ -1,4 +1,5 @@
 import {
+  CapturedPayment,
   CheckoutPaymentIntent,
   Client,
   Environment,
@@ -42,6 +43,7 @@ export class PaypalService {
   private webhookId: string | undefined;
   private includeShippingData: boolean;
   private includeCustomerData: boolean;
+  private intent: "CAPTURE" | "AUTHORIZE";
   private baseUrl: string;
 
   constructor({
@@ -51,6 +53,7 @@ export class PaypalService {
     webhookId,
     includeCustomerData,
     includeShippingData,
+    intent,
   }: AlphabitePaypalPluginOptionsType) {
     const environment = isSandbox
       ? Environment.Sandbox
@@ -88,6 +91,7 @@ export class PaypalService {
 
     this.includeCustomerData = !!includeCustomerData;
     this.includeShippingData = !!includeShippingData;
+    this.intent = intent ?? "CAPTURE";
   }
 
   async getAccessToken(): Promise<string> {
@@ -144,7 +148,10 @@ export class PaypalService {
 
     const createdOrder = await ordersController.createOrder({
       body: {
-        intent: CheckoutPaymentIntent.Capture,
+        intent:
+          this.intent === "AUTHORIZE"
+            ? CheckoutPaymentIntent.Authorize
+            : CheckoutPaymentIntent.Capture,
         purchaseUnits: [
           {
             amount: {
@@ -205,6 +212,30 @@ export class PaypalService {
     });
 
     return authorizedOrder.result;
+  }
+
+  /**
+   * Captures a previously created authorization (AUTHORIZE intent flow). This is
+   * what actually moves the funds, after the order has been authorized.
+   */
+  async captureAuthorization(
+    authorizationId: string
+  ): Promise<CapturedPayment> {
+    const captured = await this.paymentsController.captureAuthorizedPayment({
+      authorizationId,
+      body: {},
+    });
+
+    return captured.result;
+  }
+
+  /**
+   * Voids (releases) an authorization that will never be captured — e.g. when
+   * cart completion is rolled back. PayPal also voids authorizations
+   * automatically after the honor period, so this is best-effort.
+   */
+  async voidAuthorization(authorizationId: string): Promise<void> {
+    await this.paymentsController.voidPayment({ authorizationId });
   }
 
   async refundPayment(captureIds: string[]): Promise<Refund[]> {
